@@ -182,9 +182,28 @@ function node(id: string, depends_on?: string[], opts?: Partial<DagNode>): DagNo
   return { id, command: id, ...(depends_on?.length ? { depends_on } : {}), ...opts };
 }
 
-function makeOutput(state: NodeOutput['state'], output = ''): NodeOutput {
-  if (state === 'failed') return { state, output, error: 'error' };
-  return { state, output } as NodeOutput;
+/**
+ * Build a NodeOutput fixture for substitution tests.
+ * Omits `structuredOutput` when undefined so the `'structuredOutput' in nodeOutput` presence
+ * check in substituteNodeOutputRefs matches real producer behavior (Pi/Codex/Claude populate
+ * it; older providers and the pending/skipped states leave it off).
+ */
+function makeOutput(
+  state: NodeOutput['state'],
+  output = '',
+  structuredOutput?: unknown
+): NodeOutput {
+  if (state === 'failed') {
+    return structuredOutput !== undefined
+      ? { state, output, error: 'error', structuredOutput }
+      : { state, output, error: 'error' };
+  }
+  if (state === 'pending' || state === 'skipped') {
+    return { state, output } as NodeOutput;
+  }
+  return structuredOutput !== undefined
+    ? ({ state, output, structuredOutput } as NodeOutput)
+    : ({ state, output } as NodeOutput);
 }
 
 function makeWorkflowRun(id = 'dag-test-run-id', overrides?: Partial<WorkflowRun>): WorkflowRun {
@@ -751,14 +770,151 @@ describe('substituteNodeOutputRefs -- shell escaping', () => {
     expect(substituteNodeOutputRefs('echo $a.output', outputs, true)).toBe("echo 'hello\nworld'");
   });
 
-  it('object JSON field becomes quoted empty string when escapedForBash=true', () => {
+  it('object JSON field becomes JSON stringified when escapedForBash=true', () => {
     const outputs = new Map([['a', makeOutput('completed', JSON.stringify({ nested: { x: 1 } }))]]);
-    expect(substituteNodeOutputRefs('echo $a.output.nested', outputs, true)).toBe("echo ''");
+    expect(substituteNodeOutputRefs('echo $a.output.nested', outputs, true)).toBe(
+      'echo \'{"x":1}\''
+    );
+  });
+
+  it('array JSON field becomes JSON stringified', () => {
+    const outputs = new Map([
+      ['a', makeOutput('completed', JSON.stringify({ items: ['todo', 'fix'] }))],
+    ]);
+    expect(substituteNodeOutputRefs('$a.output.items', outputs)).toBe('["todo","fix"]');
+  });
+
+  it('array JSON field is shell-quoted when escapedForBash=true', () => {
+    const outputs = new Map([
+      ['a', makeOutput('completed', JSON.stringify({ items: ['todo', 'fix'] }))],
+    ]);
+    expect(substituteNodeOutputRefs('echo $a.output.items', outputs, true)).toBe(
+      'echo \'["todo","fix"]\''
+    );
+  });
+
+  it('nested object in array field becomes JSON stringified', () => {
+    const outputs = new Map([
+      [
+        'a',
+        makeOutput('completed', JSON.stringify({ files: [{ name: 'a.ts', status: 'modified' }] })),
+      ],
+    ]);
+    expect(substituteNodeOutputRefs('$a.output.files', outputs)).toBe(
+      '[{"name":"a.ts","status":"modified"}]'
+    );
+  });
+
+  it('null values in arrays stringify to "null"', () => {
+    const outputs = new Map([
+      ['a', makeOutput('completed', JSON.stringify({ items: [null, 'ok'] }))],
+    ]);
+    expect(substituteNodeOutputRefs('$a.output.items', outputs)).toBe('[null,"ok"]');
+  });
+
+  it('null object field becomes JSON stringified "null"', () => {
+    const outputs = new Map([['a', makeOutput('completed', JSON.stringify({ config: null }))]]);
+    expect(substituteNodeOutputRefs('$a.output.config', outputs)).toBe('null');
   });
 
   it('dot notation on invalid JSON returns quoted empty string when escapedForBash=true', () => {
     const outputs = new Map([['a', makeOutput('completed', 'not-json')]]);
     expect(substituteNodeOutputRefs('$a.output.field', outputs, true)).toBe("''");
+  });
+});
+
+describe('substituteNodeOutputRefs -- structuredOutput preference', () => {
+  it('prefers structuredOutput.field over JSON.parse(output)', () => {
+    // Pi-shape: prose output text with structuredOutput populated by tryParseStructuredOutput.
+    const outputs = new Map([
+      [
+        'classify',
+        makeOutput('completed', 'Here is the classification: {"type":"WRONG"}', {
+          type: 'BUG',
+          confidence: 0.9,
+        }),
+      ],
+    ]);
+    expect(substituteNodeOutputRefs('Fix $classify.output.type issue', outputs)).toBe(
+      'Fix BUG issue'
+    );
+  });
+
+  it('falls back to JSON.parse(output) when structuredOutput is absent', () => {
+    // Claude/Codex backward-compat regression: no structuredOutput, JSON in `output`.
+    const outputs = new Map([
+      ['classify', makeOutput('completed', JSON.stringify({ type: 'BUG' }))],
+    ]);
+    expect(substituteNodeOutputRefs('Fix $classify.output.type issue', outputs)).toBe(
+      'Fix BUG issue'
+    );
+  });
+
+  it('coerces structuredOutput numeric field to string', () => {
+    const outputs = new Map([['score', makeOutput('completed', '', { confidence: 0.95 })]]);
+    expect(substituteNodeOutputRefs('score=$score.output.confidence', outputs)).toBe('score=0.95');
+  });
+
+  it('coerces structuredOutput boolean field to string', () => {
+    const outputs = new Map([['n', makeOutput('completed', '', { ok: true })]]);
+    expect(substituteNodeOutputRefs('[ $n.output.ok ]', outputs)).toBe('[ true ]');
+  });
+
+  it('JSON-stringifies object structuredOutput field', () => {
+    const outputs = new Map([['n', makeOutput('completed', '', { nested: { x: 1 } })]]);
+    expect(substituteNodeOutputRefs('$n.output.nested', outputs)).toBe('{"x":1}');
+  });
+
+  it('JSON-stringifies array structuredOutput field', () => {
+    const outputs = new Map([['n', makeOutput('completed', '', { items: ['todo', 'fix'] })]]);
+    expect(substituteNodeOutputRefs('$n.output.items', outputs)).toBe('["todo","fix"]');
+  });
+
+  it('works with empty output text (Pi-only-structured case)', () => {
+    // structuredOutput populated, output text empty → dot-access still works.
+    const outputs = new Map([['classify', makeOutput('completed', '', { type: 'BUG' })]]);
+    expect(substituteNodeOutputRefs('Fix $classify.output.type issue', outputs)).toBe(
+      'Fix BUG issue'
+    );
+  });
+
+  it('null structuredOutput falls through to JSON.parse fallback', () => {
+    const outputs = new Map([
+      ['n', makeOutput('completed', JSON.stringify({ type: 'BUG' }), null)],
+    ]);
+    expect(substituteNodeOutputRefs('$n.output.type', outputs)).toBe('BUG');
+  });
+
+  it('top-level-array structuredOutput falls through to JSON.parse fallback', () => {
+    const outputs = new Map([
+      ['n', makeOutput('completed', JSON.stringify({ type: 'BUG' }), [1, 2, 3])],
+    ]);
+    expect(substituteNodeOutputRefs('$n.output.type', outputs)).toBe('BUG');
+  });
+
+  it('primitive structuredOutput falls through to JSON.parse fallback', () => {
+    const outputs = new Map([
+      ['n', makeOutput('completed', JSON.stringify({ type: 'BUG' }), 'just-a-string')],
+    ]);
+    expect(substituteNodeOutputRefs('$n.output.type', outputs)).toBe('BUG');
+  });
+
+  it('missing field in structuredOutput resolves to empty string (no JSON.parse retry)', () => {
+    // structuredOutput is authoritative; if the field is missing, do not retry output.
+    const outputs = new Map([
+      ['classify', makeOutput('completed', JSON.stringify({ type: 'BUG' }), { confidence: 0.9 })],
+    ]);
+    expect(substituteNodeOutputRefs('Fix $classify.output.type issue', outputs)).toBe('Fix  issue');
+  });
+
+  it('bare $node.output reference (no field) uses output text, not structuredOutput', () => {
+    const outputs = new Map([['n', makeOutput('completed', 'prose text', { type: 'BUG' })]]);
+    expect(substituteNodeOutputRefs('Got: $n.output', outputs)).toBe('Got: prose text');
+  });
+
+  it('structuredOutput field is shell-quoted when escapedForBash=true', () => {
+    const outputs = new Map([['n', makeOutput('completed', '', { cmd: 'foo; bar' })]]);
+    expect(substituteNodeOutputRefs('echo $n.output.cmd', outputs, true)).toBe("echo 'foo; bar'");
   });
 });
 
@@ -1136,6 +1292,54 @@ describe('executeDagWorkflow -- bash nodes', () => {
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
     const failMsg = messages.find((m: string) => m.includes('no successful nodes'));
     expect(failMsg).toBeDefined();
+  });
+
+  it('failure message surfaces stderr and does not leak the "Command failed: bash -c <body>" prefix', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-1389-run-id', {
+      workflow_name: 'bash-1389',
+      conversation_id: 'conv-1389b',
+      user_message: 'test',
+    });
+
+    // Marker is echoed to stdout only (so it lands in the command line embedded
+    // in err.message but never in stderr). If it shows up in errorMsg the
+    // prefix line was not stripped.
+    const bashNode: BashNode = {
+      id: 'fail-bash-1389',
+      bash: 'echo UNIQUE_CMDLINE_MARKER_1389; echo "diagnostic from stderr" >&2; exit 1',
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-1389b',
+      testDir,
+      { name: 'bash-1389', nodes: [bashNode] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'fail-bash-1389'
+    );
+    expect(failedEvent).toBeDefined();
+    const errorMsg = (failedEvent![0] as { data: { error: string } }).data.error;
+    expect(errorMsg).toContain("Bash node 'fail-bash-1389' failed");
+    expect(errorMsg).toContain('[exit 1]');
+    expect(errorMsg).not.toContain('Command failed:');
+    expect(errorMsg).not.toContain('UNIQUE_CMDLINE_MARKER_1389');
+    expect(errorMsg).toContain('diagnostic from stderr');
   });
 
   it('variable substitution works in bash scripts', async () => {
@@ -3140,6 +3344,266 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(mockSendQueryDag.mock.calls.length).toBe(3);
     });
 
+    it('substitutes $LOOP_PREV_OUTPUT with previous iteration output (empty on iter 1)', async () => {
+      // Iteration 1 emits a distinctive output, iteration 2 emits the completion signal.
+      // We then assert the prompt sent to the AI: iteration 1 strips $LOOP_PREV_OUTPUT
+      // to empty, iteration 2 receives iteration 1's cleaned output.
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        callCount++;
+        if (callCount === 1) {
+          yield { type: 'assistant', content: 'Iter1 output: 2 type errors in users.ts' };
+          yield { type: 'result', sessionId: 'loop-session-1' };
+        } else {
+          yield { type: 'assistant', content: 'All fixed. <promise>COMPLETE</promise>' };
+          yield { type: 'result', sessionId: 'loop-session-2' };
+        }
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-prev-output',
+          nodes: [
+            {
+              id: 'fix-loop',
+              loop: {
+                prompt: 'Previous output: <<$LOOP_PREV_OUTPUT>>. Fix and emit COMPLETE.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+                fresh_context: true,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(2);
+      const promptIter1 = mockSendQueryDag.mock.calls[0][0] as string;
+      const promptIter2 = mockSendQueryDag.mock.calls[1][0] as string;
+      // Iteration 1: $LOOP_PREV_OUTPUT substitutes to empty string.
+      expect(promptIter1).toContain('Previous output: <<>>.');
+      // Iteration 2: receives iteration 1's cleaned output.
+      expect(promptIter2).toContain(
+        'Previous output: <<Iter1 output: 2 type errors in users.ts>>.'
+      );
+    });
+
+    it('strips <promise> tags from $LOOP_PREV_OUTPUT (uses cleaned output)', async () => {
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        callCount++;
+        if (callCount === 1) {
+          // Iteration 1 includes a non-completion XML tag in its output. The cleaned
+          // output (after stripCompletionTags) drops <promise>...</promise> blocks.
+          // We use a non-matching signal here so iteration 1 does NOT complete.
+          yield {
+            type: 'assistant',
+            content: 'Real work output. <promise>NOT_DONE_YET</promise>',
+          };
+          yield { type: 'result', sessionId: 'loop-session-1' };
+        } else {
+          yield { type: 'assistant', content: 'Done. <promise>COMPLETE</promise>' };
+          yield { type: 'result', sessionId: 'loop-session-2' };
+        }
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-prev-clean',
+          nodes: [
+            {
+              id: 'fix-loop',
+              loop: {
+                prompt: 'PREV=[$LOOP_PREV_OUTPUT]',
+                until: 'COMPLETE',
+                max_iterations: 5,
+                fresh_context: true,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(2);
+      const promptIter2 = mockSendQueryDag.mock.calls[1][0] as string;
+      // The previous-output payload must be the *cleaned* output — no <promise> tags.
+      expect(promptIter2).toContain('PREV=[Real work output.');
+      expect(promptIter2).not.toContain('<promise>');
+    });
+
+    it('$LOOP_PREV_OUTPUT is empty on the first iteration after interactive resume', async () => {
+      // Regression guard for the resume-from-approval path: when an interactive
+      // loop pauses at the approval gate, the prior `lastIterationOutput` lives
+      // in a separate process and is not persisted. On resume, the executor must
+      // substitute $LOOP_PREV_OUTPUT to '' on the first resumed iteration —
+      // never to whatever the paused run produced.
+      //
+      // Wirasm-suggested shape (PR #1367 review): two executeDagWorkflow calls.
+      // The first call pauses at the gate after iteration 1; the second call
+      // resumes with metadata.approval populated and runs iteration 2.
+
+      // ---- Call 1: fresh run, iteration 1 emits no completion → pauses at gate
+      mockSendQueryDag.mockImplementationOnce(function* () {
+        yield { type: 'assistant', content: 'Iter1 output: 2 type errors in users.ts' };
+        yield { type: 'result', sessionId: 'loop-session-1' };
+      });
+      const mockDeps1 = createMockDeps();
+      const platform1 = createMockPlatform();
+      const freshRun = makeWorkflowRun('resume-prev-fresh-run');
+
+      await executeDagWorkflow(
+        mockDeps1,
+        platform1,
+        'conv-dag',
+        testDir,
+        {
+          name: 'interactive-loop-resume-prev-output',
+          nodes: [
+            {
+              id: 'refine',
+              loop: {
+                prompt:
+                  'User: $LOOP_USER_INPUT. PREV=<<$LOOP_PREV_OUTPUT>>. Continue or emit COMPLETE.',
+                until: 'COMPLETE',
+                max_iterations: 10,
+                interactive: true,
+                gate_message: 'Review and provide feedback.',
+              },
+            },
+          ],
+        },
+        freshRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // First iteration of a fresh interactive loop: $LOOP_PREV_OUTPUT empty;
+      // $LOOP_USER_INPUT empty (no user has spoken yet).
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      const promptIter1 = mockSendQueryDag.mock.calls[0][0] as string;
+      expect(promptIter1).toContain('PREV=<<>>.');
+      expect(promptIter1).toContain('User: .');
+      // Fresh interactive loop must pause at the gate, not return early.
+      const pauseCalls1 = (
+        mockDeps1.store.pauseWorkflowRun as Mock<
+          (id: string, ctx: Record<string, unknown>) => Promise<void>
+        >
+      ).mock.calls;
+      expect(pauseCalls1.length).toBe(1);
+      expect(pauseCalls1[0][1]).toMatchObject({
+        type: 'interactive_loop',
+        nodeId: 'refine',
+        iteration: 1,
+      });
+
+      // ---- Call 2: resumed run — metadata carries iter 1 + user input.
+      // iter 2 emits the completion signal so the loop exits cleanly.
+      mockSendQueryDag.mockImplementationOnce(function* () {
+        yield { type: 'assistant', content: 'All clear. <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'loop-session-2' };
+      });
+      const mockDeps2 = createMockDeps();
+      const platform2 = createMockPlatform();
+      const resumedRun = makeWorkflowRun('resume-prev-resume-run', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'refine',
+            iteration: 1,
+            sessionId: 'loop-session-1',
+            message: 'Review and provide feedback.',
+          },
+          loop_user_input: 'looks good, ship it',
+        },
+      });
+
+      await executeDagWorkflow(
+        mockDeps2,
+        platform2,
+        'conv-dag',
+        testDir,
+        {
+          name: 'interactive-loop-resume-prev-output',
+          nodes: [
+            {
+              id: 'refine',
+              loop: {
+                prompt:
+                  'User: $LOOP_USER_INPUT. PREV=<<$LOOP_PREV_OUTPUT>>. Continue or emit COMPLETE.',
+                until: 'COMPLETE',
+                max_iterations: 10,
+                interactive: true,
+                gate_message: 'Review and provide feedback.',
+              },
+            },
+          ],
+        },
+        resumedRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Second executeDagWorkflow call started a fresh sendQuery generator (mock
+      // call index 1 across the two runs). The resumed iteration must NOT carry
+      // the prior process's iter-1 output through $LOOP_PREV_OUTPUT — it must
+      // substitute to ''.
+      expect(mockSendQueryDag.mock.calls.length).toBe(2);
+      const promptResumeIter = mockSendQueryDag.mock.calls[1][0] as string;
+      expect(promptResumeIter).toContain('PREV=<<>>.');
+      expect(promptResumeIter).not.toContain('Iter1 output: 2 type errors');
+      // The resume's user input flows through on the first resumed iteration.
+      expect(promptResumeIter).toContain('User: looks good, ship it.');
+      // Resume call exits via completion, not via a second pause at the gate.
+      const pauseCalls2 = (
+        mockDeps2.store.pauseWorkflowRun as Mock<
+          (id: string, ctx: Record<string, unknown>) => Promise<void>
+        >
+      ).mock.calls;
+      expect(pauseCalls2.length).toBe(0);
+    });
+
     it('fails when max_iterations exceeded', async () => {
       mockSendQueryDag.mockImplementation(function* () {
         yield { type: 'assistant', content: 'Still working...' };
@@ -3979,6 +4443,64 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(failedData.error).toContain('Subprocess crashed mid-turn');
     });
 
+    it('loop iteration does NOT fail on isError: true + errorSubtype: success', async () => {
+      // Regression test for #1425 (loop-branch counterpart of the main-path
+      // test). Stop_sequence terminations carry is_error: true + subtype:
+      // 'success' under the Claude SDK contract; previously, the loop branch
+      // threw "SDK returned success" and aborted the iteration even though
+      // the AI had completed its work correctly.
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'Done. DONE.' };
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'success',
+          stopReason: 'stop_sequence',
+          sessionId: 'sid-loop-stop',
+        };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'loop-success-stop-seq-test',
+          nodes: [
+            {
+              id: 'work',
+              loop: {
+                prompt: 'Do the work. Say DONE.',
+                until: 'DONE',
+                max_iterations: 3,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failedEvents = eventCalls.filter((call: unknown[]) => {
+        const evt = (call[0] as Record<string, unknown>).event_type as string;
+        return evt === 'node_failed' || evt === 'loop_iteration_failed';
+      });
+      expect(failedEvents).toHaveLength(0);
+    });
+
     it('non-interactive loop is unaffected (no pause)', async () => {
       mockSendQueryDag.mockImplementation(function* () {
         yield { type: 'assistant', content: 'Still working...' };
@@ -4223,17 +4745,21 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     expect(result).toBe('Final summary text');
   });
 
-  it('returns undefined when the single terminal node produces no output', async () => {
+  it('fails node when the AI stream closes with no assistant output', async () => {
+    // Empty assistant output on AI nodes (`command:`/`prompt:`) typically
+    // indicates a silent provider rejection or stream interruption that
+    // didn't yield a result.isError chunk. Treat it as a node failure
+    // rather than a successful empty completion.
     mockSendQueryDag.mockImplementation(async function* () {
-      // No assistant content — empty output
       yield { type: 'result', sessionId: 'sess-empty' };
     });
 
-    const mockDeps = createMockDeps();
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
 
-    const result = await executeDagWorkflow(
+    await executeDagWorkflow(
       mockDeps,
       platform,
       'conv-dag',
@@ -4249,7 +4775,120 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       minimalConfig
     );
 
-    expect(result).toBeUndefined();
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const nodeFailedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    expect(nodeFailedEvents.length).toBeGreaterThan(0);
+    const failedData = (nodeFailedEvents[0][0] as Record<string, unknown>).data as Record<
+      string,
+      unknown
+    >;
+    expect(failedData.error).toContain('produced no assistant output');
+    // Workflow-level failure must propagate, not just the node event.
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+  });
+
+  it('does NOT fail node when stream yields no assistant text but a structuredOutput is present', async () => {
+    // Output-format nodes legitimately produce zero free-form text — the
+    // useful payload is the structuredOutput field. The empty-output guard
+    // must spare them.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'result',
+        sessionId: 'sess-structured',
+        structuredOutput: { category: 'math' },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'structured-only-dag',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'Classify this',
+            output_format: { type: 'object', properties: {} },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const nodeFailedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    expect(nodeFailedEvents.length).toBe(0);
+    const nodeCompletedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_completed'
+    );
+    expect(nodeCompletedEvents.length).toBeGreaterThan(0);
+  });
+
+  it('fails the run when a node specifies an unknown provider (defense-in-depth at execution time)', async () => {
+    // Loader-time validation also catches this (loader.ts iterates dagNodes
+    // after parsing), but the dag-executor's resolveNodeProviderAndModel
+    // throws as defense-in-depth in case a code path bypasses the loader.
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'unknown-provider-dag',
+        nodes: [
+          {
+            id: 'bad',
+            command: 'my-cmd',
+            provider: 'claud', // typo
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+    // The "unknown provider" detail surfaces on the node_failed event; the
+    // workflow-level fail message is a generic "no successful nodes" summary.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const nodeFailedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    expect(nodeFailedEvents.length).toBeGreaterThan(0);
+    const nodeFailedData = (nodeFailedEvents[0][0] as Record<string, unknown>).data as Record<
+      string,
+      unknown
+    >;
+    expect(nodeFailedData.error).toContain("unknown provider 'claud'");
   });
 
   it('excludes intermediate nodes with dependents from terminal set (fan-in DAG)', async () => {
@@ -4674,6 +5313,76 @@ describe('executeDagWorkflow -- approval node', () => {
     expect(pauseCalls.length).toBe(1);
   });
 
+  it('on_reject does not write node_completed for the approval gate node ID', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'Fixed based on feedback' };
+      yield { type: 'result', sessionId: 'reject-no-poison-session' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+
+    const workflowRun = makeWorkflowRun('reject-no-poison-run', {
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review',
+          message: 'Approve this plan?',
+          onRejectPrompt: 'Fix based on: $REJECTION_REASON',
+          onRejectMaxAttempts: 3,
+        },
+        rejection_reason: 'Missing edge case handling',
+        rejection_count: 1,
+      },
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-approval',
+      testDir,
+      {
+        name: 'approval-no-poison',
+        nodes: [
+          {
+            id: 'review',
+            approval: {
+              message: 'Approve this plan?',
+              on_reject: { prompt: 'Fix based on: $REJECTION_REASON', max_attempts: 3 },
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The on_reject synthetic node must NOT produce a node_completed event with
+    // step_name equal to the approval gate's own ID ('review'). If it did, a
+    // subsequent resume would find the event via getCompletedDagNodeOutputs and
+    // skip the approval gate entirely, bypassing the human gate.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const nodeCompletedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_completed'
+    );
+    const completedStepNames = nodeCompletedEvents.map(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).step_name
+    );
+    expect(completedStepNames).not.toContain('review');
+
+    // The synthetic on_reject node MUST produce a node_completed event with the
+    // distinct ID 'review:on_reject'. This ensures the synthetic node itself is
+    // recorded as completed so it is not re-run on a subsequent resume.
+    expect(completedStepNames.filter((n: unknown) => n === 'review:on_reject').length).toBe(1);
+  });
+
   it('on_reject cancels when max_attempts exhausted', async () => {
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
@@ -4785,6 +5494,112 @@ describe('executeDagWorkflow -- approval node', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(0);
     expect((store.cancelWorkflowRun as Mock<(id: string) => Promise<void>>).mock.calls.length).toBe(
       1
+    );
+  });
+
+  it('approval message substitutes $nodeId.output.field references from upstream structured output', async () => {
+    // Repro for: approval gates were rendering literal "$gather-context.output.repo_name"
+    // instead of resolved values, breaking interactive workflows like atlas-onboard.
+    // Parity: prompt/bash/loop/cancel nodes already get substituteNodeOutputRefs;
+    // approval.message must too so the human sees concrete values.
+    const structuredJson = {
+      repo_name: 'hcr-els',
+      app_code: 'CCELS',
+      frontend_port: 3012,
+    };
+
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'gather-context.md'), 'Gather context: $USER_MESSAGE');
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: JSON.stringify(structuredJson) };
+      yield { type: 'result', sessionId: 'sid-approval-sub', structuredOutput: structuredJson };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('approval-sub-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-approval-sub',
+      testDir,
+      {
+        name: 'approval-sub-test',
+        nodes: [
+          {
+            id: 'gather-context',
+            command: 'gather-context',
+            output_format: {
+              type: 'object',
+              properties: {
+                repo_name: { type: 'string' },
+                app_code: { type: 'string' },
+                frontend_port: { type: 'number' },
+              },
+            },
+          },
+          {
+            id: 'confirm',
+            depends_on: ['gather-context'],
+            approval: {
+              message:
+                'Repo: $gather-context.output.repo_name | App: $gather-context.output.app_code | Port: $gather-context.output.frontend_port',
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // gather-context AI call ran once; approval node does NOT call AI
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+
+    // pauseWorkflowRun should receive the SUBSTITUTED message, not the literal placeholders
+    const pauseCalls = (
+      store.pauseWorkflowRun as Mock<(id: string, ctx: Record<string, unknown>) => Promise<void>>
+    ).mock.calls;
+    expect(pauseCalls.length).toBe(1);
+    expect(pauseCalls[0][1]).toMatchObject({
+      type: 'approval',
+      nodeId: 'confirm',
+      message: 'Repo: hcr-els | App: CCELS | Port: 3012',
+    });
+
+    // The fix touches FOUR emission sites (safeSendMessage / createWorkflowEvent /
+    // pauseWorkflowRun / event-emitter). Assert the other two reachable surfaces too —
+    // a future regression at any one of them would otherwise pass this test silently.
+    // (Per CodeRabbit review of PR coleam00/Archon#1426.)
+
+    // (a) The chat-surface prompt emitted via platform.sendMessage must contain the
+    //     substituted message and must NOT contain literal $gather-context.output refs.
+    const sentMessages = (
+      platform.sendMessage as Mock<(...args: unknown[]) => Promise<void>>
+    ).mock.calls.map((c: unknown[]) => c[1] as string);
+    expect(sentMessages.some(m => m.includes('Repo: hcr-els | App: CCELS | Port: 3012'))).toBe(
+      true
+    );
+    expect(sentMessages.some(m => m.includes('$gather-context.output'))).toBe(false);
+
+    // (b) The persisted approval_requested workflow event's data.message must be substituted.
+    const approvalRequestedEvents = (
+      store.createWorkflowEvent as Mock<() => Promise<void>>
+    ).mock.calls.filter(
+      (c: unknown[]) => (c[0] as { event_type: string }).event_type === 'approval_requested'
+    );
+    expect(approvalRequestedEvents.length).toBe(1);
+    expect((approvalRequestedEvents[0][0] as { data: { message: string } }).data.message).toBe(
+      'Repo: hcr-els | App: CCELS | Port: 3012'
     );
   });
 });
@@ -5054,6 +5869,57 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
     expect(failedData.error).toContain('permission denied');
   });
 
+  it('does NOT fail node when SDK returns isError: true + errorSubtype: success', async () => {
+    // Regression test for #1425: stop_sequence terminations under the Claude
+    // SDK contract carry is_error: true + subtype: 'success'. The provider
+    // normalises this, but the executor keeps an explicit guard so a future
+    // provider regression or a third-party IAgentProvider that forwards the
+    // SDK pair raw cannot reintroduce the "SDK returned success" false-failure.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'classified output' };
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'success',
+        stopReason: 'stop_sequence',
+        sessionId: 'sid-stop',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'success-stop-seq-test',
+        nodes: [{ id: 'classify', command: 'my-cmd' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const nodeFailedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    expect(nodeFailedEvents).toHaveLength(0);
+
+    const completeCalls = (store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls;
+    expect(completeCalls.length).toBeGreaterThan(0);
+  });
+
   it('forwards workflow-level effort to node when no per-node override', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
@@ -5224,6 +6090,7 @@ describe('executeDagWorkflow -- cost tracking', () => {
     let callCount = 0;
     mockSendQueryDag.mockImplementation(function* () {
       callCount++;
+      yield { type: 'assistant', content: `Step ${String(callCount)} output` };
       yield { type: 'result', sessionId: `sid-${String(callCount)}`, cost: 0.001 };
     });
 
@@ -5265,6 +6132,7 @@ describe('executeDagWorkflow -- cost tracking', () => {
 
   it('omits total_cost_usd from completeWorkflowRun when no cost yielded', async () => {
     mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'Some output' };
       yield { type: 'result', sessionId: 'sid-no-cost' };
     });
 
@@ -5569,6 +6437,61 @@ describe('executeDagWorkflow -- script nodes', () => {
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
     const failMsg = messages.find((m: string) => m.includes('no successful nodes'));
     expect(failMsg).toBeDefined();
+  });
+
+  it('failure message strips the "Command failed: bun -e <body>" prefix and stays small', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('script-1389-run-id', {
+      workflow_name: 'script-1389',
+      conversation_id: 'conv-1389s',
+      user_message: 'test',
+    });
+
+    // 500 × 7 chars = 3.5 KB — larger than SUBPROCESS_ERROR_MAX_CHARS (2 KB),
+    // so any leak of the full script body via err.message would violate the length
+    // assertion below. Block-comment padding (no newlines) avoids Windows execFile
+    // arg truncation at \n that would cause bun to exit 0 on the comment-only prefix.
+    const paddingAboveMax = '/* p */'.repeat(500);
+    const scriptNode: ScriptNode = {
+      id: 'fail-script-1389',
+      script: `${paddingAboveMax} this is not valid javascript`,
+      runtime: 'bun',
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-1389s',
+      testDir,
+      { name: 'script-1389', nodes: [scriptNode] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'fail-script-1389'
+    );
+    expect(failedEvent).toBeDefined();
+    const errorMsg = (failedEvent![0] as { data: { error: string } }).data.error;
+    expect(errorMsg).toContain("Script node 'fail-script-1389' failed");
+    expect(errorMsg).not.toContain('Command failed:');
+    expect(errorMsg).not.toContain('padding line padding line padding line');
+    // 2 KB diagnostic cap + label prefix + truncation marker should stay under
+    // 2.1 KB. Bumping SUBPROCESS_ERROR_MAX_CHARS would trip this.
+    expect(errorMsg.length).toBeLessThan(2100);
+    // Bun emits `error: <description>\n    at [eval]:L:C` for parse failures —
+    // the location marker is the strongest signal that the diagnostic survived.
+    expect(errorMsg).toContain('[eval]');
   });
 
   it('timeout kills subprocess', async () => {
@@ -6077,5 +7000,311 @@ describe('shouldContinueStreamingForStatus', () => {
     const { shouldContinueStreamingForStatus } = await import('./dag-executor');
     expect(shouldContinueStreamingForStatus('pending')).toBe(false);
     expect(shouldContinueStreamingForStatus('invalid-status')).toBe(false);
+  });
+});
+
+describe('executeDagWorkflow -- final status derivation', () => {
+  // Invariant: if ANY non-skipped node has failed status, the run must be
+  // marked 'failed' — never 'completed' — regardless of how many other nodes
+  // succeeded. This covers the anyFailed branch in executeDagWorkflow
+  // (dag-executor.ts ~line 2956), which had no direct test coverage.
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-status-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('one success + one independent failure -> failWorkflowRun, not completeWorkflowRun', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-status-run-1');
+
+    const nodes: DagNode[] = [
+      { id: 'pass', bash: 'echo ok' } as BashNode,
+      { id: 'fail', bash: 'exit 1' } as BashNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-status',
+      testDir,
+      { name: 'status-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+    expect(mockStore.failWorkflowRun).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('fail')
+    );
+
+    // Confirm the failure message names the failing node
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    const failMsg = messages.find((m: string) => m.includes('completed with failures'));
+    expect(failMsg).toBeDefined();
+  });
+
+  it('multiple successes + one failure -> failWorkflowRun, not completeWorkflowRun', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-status-run-2');
+
+    const nodes: DagNode[] = [
+      { id: 'a', bash: 'echo a' } as BashNode,
+      { id: 'b', bash: 'echo b' } as BashNode,
+      { id: 'c', bash: 'echo c' } as BashNode,
+      { id: 'fail', bash: 'exit 1' } as BashNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-status',
+      testDir,
+      { name: 'status-test-multi', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+    expect(mockStore.failWorkflowRun).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('fail')
+    );
+
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    const failMsg = messages.find((m: string) => m.includes('completed with failures'));
+    expect(failMsg).toBeDefined();
+  });
+
+  it('trigger_rule: none_failed skips dependent node + anyFailed still marks run failed', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-status-run-3');
+
+    // Layer 1: A and B run in parallel. B fails.
+    // Layer 2: C depends on B with trigger_rule: none_failed — so C is skipped.
+    // Expected: anyFailed=true (from B), so run must be marked failed even though C is only skipped.
+    const nodes: DagNode[] = [
+      { id: 'a', bash: 'echo a' } as BashNode,
+      { id: 'b', bash: 'exit 1' } as BashNode,
+      { id: 'c', bash: 'echo c', depends_on: ['b'], trigger_rule: 'none_failed' } as BashNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-status',
+      testDir,
+      { name: 'status-test-skip', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+    expect(mockStore.failWorkflowRun).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('b')
+    );
+  });
+});
+
+describe('provider resolution -- regression for #1610', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-provider-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'my-cmd.md'), 'My command prompt for $USER_MESSAGE');
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'response' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('node with no provider annotation routes to workflowProvider (codex), not to model-implied provider', async () => {
+    // Regression: a node with model: opus[1m] but no provider: must route to
+    // workflowProvider ('codex' when defaultAssistant: codex), not to 'claude'.
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-provider',
+      testDir,
+      // Node has model: opus[1m] but NO provider: — must inherit workflowProvider
+      {
+        name: 'provider-regression',
+        nodes: [{ id: 'implement', command: 'my-cmd', model: 'opus[1m]' }],
+      },
+      workflowRun,
+      'codex', // workflowProvider (simulates defaultAssistant: codex)
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'codex' }
+    );
+
+    // getAgentProvider must have been called with 'codex', not 'claude'
+    expect(mockGetAgentProviderDag).toHaveBeenCalledWith('codex');
+    expect(mockGetAgentProviderDag).not.toHaveBeenCalledWith('claude');
+  });
+
+  it('node with explicit provider: claude routes to claude even when workflowProvider is codex', async () => {
+    // When provider: claude is set on the node, it must override workflowProvider.
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-provider',
+      testDir,
+      // Node has both model: opus[1m] AND provider: claude
+      {
+        name: 'provider-explicit',
+        nodes: [{ id: 'implement', command: 'my-cmd', model: 'opus[1m]', provider: 'claude' }],
+      },
+      workflowRun,
+      'codex', // workflowProvider
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'codex' }
+    );
+
+    // getAgentProvider must have been called with 'claude'
+    expect(mockGetAgentProviderDag).toHaveBeenCalledWith('claude');
+  });
+});
+
+describe('bundled opus nodes -- provider annotation invariant (#1610)', () => {
+  it('every bundled node with an opus model has provider: claude at the node or workflow level', async () => {
+    // Resolve the defaults directory relative to this package (same logic as getAppArchonBasePath).
+    // import.meta.dir = packages/workflows/src → go up 3 levels to repo root → .archon/workflows/defaults
+    const repoRoot = join(import.meta.dir, '..', '..', '..');
+    const defaultsDir = join(repoRoot, '.archon', 'workflows', 'defaults');
+
+    const { readdir, readFile: readFileFs } = await import('fs/promises');
+    const files = (await readdir(defaultsDir)).filter(f => f.endsWith('.yaml'));
+    expect(files.length).toBeGreaterThan(0);
+
+    for (const file of files) {
+      const src = await readFileFs(join(defaultsDir, file), 'utf-8');
+      const result = parseWorkflow(src, file);
+      if (!('workflow' in result)) continue; // skip load errors
+
+      const wf = result.workflow;
+      if (!('nodes' in wf) || !wf.nodes) continue; // skip non-DAG workflows
+
+      const workflowProvider: string | undefined = (wf as { provider?: string }).provider;
+
+      for (const n of wf.nodes) {
+        const nodeModel: string | undefined = (n as { model?: string }).model;
+        if (!nodeModel || !nodeModel.toLowerCase().includes('opus')) continue;
+
+        const nodeProvider: string | undefined = (n as { provider?: string }).provider;
+        const hasExplicitClaude = nodeProvider === 'claude' || workflowProvider === 'claude';
+
+        expect(hasExplicitClaude).toBe(true);
+        if (!hasExplicitClaude) {
+          // Surface which file+node is missing the annotation
+          throw new Error(
+            `${file}: node '${(n as { id?: string }).id ?? '?'}' has model '${nodeModel}' but no provider: claude at node or workflow level`
+          );
+        }
+      }
+    }
   });
 });

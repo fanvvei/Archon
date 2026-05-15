@@ -25,6 +25,8 @@ import {
   detectCompletionSignal,
   stripCompletionTags,
   isInlineScript,
+  formatSubprocessFailure,
+  classifyError,
 } from './executor-shared';
 
 describe('substituteWorkflowVariables', () => {
@@ -252,6 +254,50 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Fix: ');
   });
+
+  it('replaces $LOOP_PREV_OUTPUT with the previous iteration output', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Last pass said:\n$LOOP_PREV_OUTPUT',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      'QA failed: 2 type errors in users.ts'
+    );
+    expect(prompt).toBe('Last pass said:\nQA failed: 2 type errors in users.ts');
+  });
+
+  it('clears $LOOP_PREV_OUTPUT when not provided (first iteration)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Previous output: $LOOP_PREV_OUTPUT (end)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Previous output:  (end)');
+  });
+
+  it('does not affect prompts that omit $LOOP_PREV_OUTPUT', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Plain prompt with no loop variable.',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      'unused previous output'
+    );
+    expect(prompt).toBe('Plain prompt with no loop variable.');
+  });
 });
 
 describe('buildPromptWithContext', () => {
@@ -436,5 +482,113 @@ describe('stripCompletionTags', () => {
   it('strips both <promise> and XML-tagged signal when until is provided', () => {
     const input = 'Done. <promise>ALL_CLEAN</promise> <COMPLETE>ALL_CLEAN</COMPLETE>';
     expect(stripCompletionTags(input, 'ALL_CLEAN')).toBe('Done.');
+  });
+});
+
+describe('formatSubprocessFailure', () => {
+  it('strips the "Command failed: <cmd>" prefix line so the script body does not appear', () => {
+    const err = {
+      message:
+        'Command failed: bun --no-env-file -e import { writeFileSync } from "node:fs"; const x = `hello`;\n' +
+        'error: Expected ")" but found "x"\n    at [eval]:1:50',
+      stderr: '',
+      code: 1,
+    };
+    const { userMessage } = formatSubprocessFailure(err, "Script node 'n1'");
+    expect(userMessage).not.toContain('Command failed:');
+    expect(userMessage).not.toContain('writeFileSync'); // script body must not leak
+    expect(userMessage).toContain('Expected ")"');
+    expect(userMessage).toContain('[eval]:1:50');
+    expect(userMessage).toContain('[exit 1]');
+  });
+
+  it('prefers stderr over message body when both are present', () => {
+    const err = {
+      message:
+        'Command failed: bash -c long script body that should not appear\nfallback text in message',
+      stderr: 'clean diagnostic from stderr',
+      code: 2,
+    };
+    const { userMessage } = formatSubprocessFailure(err, "Bash node 'b1'");
+    expect(userMessage).toContain('clean diagnostic from stderr');
+    expect(userMessage).not.toContain('long script body');
+    expect(userMessage).toContain('[exit 2]');
+  });
+
+  it('truncates diagnostics larger than 2 KB from the tail', () => {
+    const big = 'x'.repeat(5000) + '\nactual error at end';
+    const { userMessage } = formatSubprocessFailure(
+      { message: 'Command failed: cmd\n', stderr: big, code: 1 },
+      "Script node 'n1'"
+    );
+    expect(userMessage).toContain('actual error at end');
+    expect(userMessage).toContain('[truncated]');
+    // Tight bound: ~2 KB diagnostic + label prefix + truncation suffix should fit
+    // well under 2.1 KB. Bumping SUBPROCESS_ERROR_MAX_CHARS would trip this.
+    expect(userMessage.length).toBeLessThan(2100);
+  });
+
+  it('logFields never contain the full message, stack, or cmd', () => {
+    const err = {
+      message: 'Command failed: bun -e const body = "SECRET_BODY"\n',
+      stack: 'Error: Command failed: bun -e const body = "SECRET_BODY"\n    at …',
+      cmd: 'bun -e const body = "SECRET_BODY"',
+      stderr: 'short stderr',
+      code: 1,
+    };
+    const { logFields } = formatSubprocessFailure(err, "Script node 'n1'");
+    const serialized = JSON.stringify(logFields);
+    expect(serialized).not.toContain('SECRET_BODY');
+    expect(serialized).not.toContain('Command failed:');
+    expect(logFields.exitCode).toBe(1);
+    expect(logFields.stderrTail).toBe('short stderr');
+  });
+
+  it('falls back when stderr is empty and there is no "Command failed:" prefix', () => {
+    const err = { message: 'ENOENT: bash not found', code: 127 };
+    const { userMessage } = formatSubprocessFailure(err, "Bash node 'b1'");
+    expect(userMessage).toContain('ENOENT: bash not found');
+    expect(userMessage).toContain('[exit 127]');
+  });
+
+  it('handles a completely empty error object without throwing', () => {
+    const { userMessage, logFields } = formatSubprocessFailure({}, "Bash node 'b1'");
+    expect(userMessage).toContain("Bash node 'b1' failed");
+    expect(userMessage).toContain('unknown error');
+    expect(logFields.exitCode).toBeUndefined();
+    expect(logFields.killed).toBe(false);
+    expect(logFields.stderrTail).toBeUndefined();
+  });
+
+  it('omits the [exit N] suffix when no code is present', () => {
+    const { userMessage } = formatSubprocessFailure({ stderr: 'diagnostic' }, "Script node 'n1'");
+    expect(userMessage).not.toContain('[exit');
+    expect(userMessage).toContain('diagnostic');
+  });
+});
+
+describe('classifyError', () => {
+  it('classifies 429 as TRANSIENT', () => {
+    expect(classifyError(new Error('rate limit: 429 too many requests'))).toBe('TRANSIENT');
+  });
+
+  it('classifies 529 as TRANSIENT', () => {
+    expect(classifyError(new Error('HTTP 529 service overloaded'))).toBe('TRANSIENT');
+  });
+
+  it('classifies overloaded messages as TRANSIENT', () => {
+    expect(classifyError(new Error('Minimax: overloaded, try again later'))).toBe('TRANSIENT');
+  });
+
+  it('classifies 401 as FATAL', () => {
+    expect(classifyError(new Error('401 unauthorized'))).toBe('FATAL');
+  });
+
+  it('FATAL takes priority over TRANSIENT when both match', () => {
+    expect(classifyError(new Error('unauthorized: exited with code 1'))).toBe('FATAL');
+  });
+
+  it('classifies unknown errors as UNKNOWN', () => {
+    expect(classifyError(new Error('something completely unexpected happened'))).toBe('UNKNOWN');
   });
 });

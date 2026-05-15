@@ -7,6 +7,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-05-14
+
+Orchestrator prompt-cache fix, SDK termination edge cases, marketplace expansion, and broad workflow fixes.
+
+### Added
+
+- **New marketplace workflow `archon-idea-to-wo`**: interactive 8-node workflow that turns a raw idea into BKM-format Work Orders through four AI phases with approval gates between each. Authored by @lamachine, published via the community marketplace registry (closes #1647).
+
+### Changed
+
+- `maintainer-review-pr`: dropped the direction/scope gate node. The gate used Pi/Minimax to return a structured JSON verdict that the DAG branched on, but Pi intermittently wrapped the JSON in markdown fences or preamble prose, silently skipping every downstream review. In practice the gate returned "review" on every hand-picked PR (13/13 runs over two days), adding no signal. Workflow now reviews all PRs directly (#1675).
+
+### Fixed
+
+- **Claude `stop_sequence` terminations no longer fail as "SDK returned success"**: the Claude Agent SDK's `SDKResultSuccess` declares `is_error: boolean` (not literal `false`), and stop-sequence terminations carry `is_error: true` alongside `subtype: 'success'` — its encoding of "non-default termination, not a failure". The Claude provider now normalises this pair to a clean success at the provider boundary, with defense-in-depth guards in `dag-executor` (main + loop branches) and `orchestrator-agent` (direct chat) so a third-party `IAgentProvider` forwarding the raw SDK pair can't reintroduce the bug. Workflows using `output_format` (which implies a stop sequence) — including the `archon-fix-github-issue` `classify` → `synthesize` pipeline — now complete cleanly instead of throwing `Node 'X' failed: SDK returned success`. Closes #1425 (#1662).
+- **Orchestrator prompt caching restored**: static system context (projects, workflows, routing rules) was embedded in the per-turn `prompt`, forcing the Anthropic API to rebuild the cache prefix on every request (high `cache_creation_input_tokens`, zero `cache_read_input_tokens`). Moved into `systemPrompt.append`, which extends the Claude Code preset and is part of the cacheable system prefix. Fixes #1591 (#1634).
+- **Native Claude tools no longer stripped when `skills:` is set without `allowed_tools:`**: the AgentDefinition wrapper previously defaulted `tools` to `['Skill']` only, removing Read/Bash/Write/etc. Now omits `tools` when not explicitly set, letting the SDK provide its full default tool set; `Skill` is still appended when `allowed_tools` is explicit (#1605, #1661).
+- **SSH repo URLs from non-GitHub hosts**: the SSH-to-HTTPS converter only matched `git@github.com:` literally, so custom SSH host aliases, GitHub Enterprise, Gitea, GitLab, and Bitbucket SSH URLs produced workspace paths containing literal `git@<host>:` segments — `ENOTDIR` on Windows, malformed owner extraction on Unix. Now uses a generic `git@([^:]+):(.+)` regex at both call sites. Closes #1614 (#1656).
+- **`$node.output.field` for Pi/Minimax structured output**: provider-parsed fence-wrapped or preamble-prefixed JSON was captured locally but never persisted onto `NodeOutput`. Downstream `substituteNodeOutputRefs` and `condition-evaluator` consumers then `JSON.parse`d the original prose-prefixed text, threw, and resolved `$node.output.field` to empty. `structuredOutput` is now persisted on `NodeOutput` (single-shot + loop-terminal-iteration success paths) and both consumers prefer the parsed object. Closes #1571 (#1654).
+- **Marketplace auto-review CI**: workflow now triggers on `ready_for_review` (was missed by default `pull_request_target` event list); `gh pr review --approve` falls back to `gh pr comment` when GitHub Actions lacks approve permission, so PR authors still receive the review even without "Allow GitHub Actions to create and approve pull requests" enabled.
+
+## [0.3.11] - 2026-05-12
+
+Workflow marketplace, expanded setup wizard, and broad Pi/workflow engine fixes.
+
+### Added
+
+- **Workflow marketplace v0**: browse and install community workflows via `archon workflow search [query]` and `archon workflow install <slug>` (#1624). Includes an automated marketplace PR review-and-merge workflow that runs schema validation, security scanning, and AI review on submissions (#1638), plus a `video-generic` entry as the first published workflow.
+- **`archon setup` overhaul**: full interactive credential and config wizard, plus `archon doctor` to verify Claude binary, gh auth, DB, and adapters end-to-end (#1566). Pi is now a first-class provider option in the wizard (#1609).
+- **`archon skill install`**: install the bundled Archon skill into `.claude/skills/archon` from the CLI without needing the source tree (#1445).
+- **Pi/Minimax variants** of the maintainer workflows: `repo-triage-minimax` (#1562) joins `maintainer-standup-minimax` for daily triage when nested-Claude-Code sessions block the Claude variants.
+- **Public roadmap page** at `/roadmap` on the docs site (#1570).
+- Docker: `/home/appuser` is now persisted by default via the `archon_user_home` named volume, so user-installed Claude Code skills/commands/agents/hooks, Codex/Pi auth, `~/.gitconfig`, and shell history survive container rebuilds. Set `ARCHON_USER_HOME=/host/path` in `.env` to bind-mount a host path instead (#1517, #1518).
+
+### Changed
+
+- Claude provider default `settingSources` changed from `['project']` to `['project', 'user']`, so skills, commands, agents, and `CLAUDE.md` from `~/.claude/` are now loaded by default in all environments — not just Docker. Without this, the new `/home/appuser` persistence would not actually surface user-installed Claude resources. Set `assistants.claude.settingSources: ['project']` in `.archon/config.yaml` to restore the previous project-only behavior (#1518).
+- `.env.example`, `docker-compose.yml`, `deploy/docker-compose.yml`, and `reference/configuration.md` now document that `ARCHON_HOME` is silently overridden inside Docker and `ARCHON_DATA` is a Compose-only host token never read by source. The Docker entrypoint emits a one-line stderr warning when either is set in the container env (#1517).
+- Bump `hono` to ^4.12.16 and `@hono/node-server` to ^1.19.13 (closes #1484, #1499).
+- Pi provider now loads user settings files (`~/.pi/agent/auth.json` etc.) as the session baseline (#1559).
+
+### Fixed
+
+- **Resume is now explicit**: `archon workflow run` no longer silently auto-resumes the previous failed run for the same `(workflow_name, cwd)` pair. The implicit `findResumableRun` call inside `executeWorkflow` was the cause of cross-invocation state leaks — completed-node outputs from a prior failed run would bleed into the next invocation of the same workflow at the same path. Use `archon workflow run --resume`, `archon workflow resume <id>`, or the web UI resume button to opt in. `executeWorkflow`'s trailing positional args are consolidated into an options bag and a new `prepareResumedRun` / `hydrateResumableRun` pair handles resume preparation at call sites. Closes #1392 (#1646).
+- **Pi multi-chunk slash commands**: Pi agent can now successfully use `/invoke-workflow` and `/register-project` when the assistant streams the command across multiple chunks. The orchestrator continues accumulating assistant text past prefix detection until the full command is parsed (#1581).
+- **Pi concurrency + error surfacing**: SDK error messages now surface to the user instead of being masked, and Pi concurrency is capped to prevent cascade failures (#1572).
+- Chat hydration shows newest messages instead of oldest (#1532).
+- `GET /api/workflows/:name` now resolves home-scoped (`~/.archon/workflows/`) workflows that were previously invisible to the Web UI builder (#1405).
+- `GET /api/workflows` no longer returns an empty array when no `cwd` query param is provided and no codebases are registered — bundled and home-scoped workflows now surface correctly on first run, making the workflow picker functional on first launch before any project is registered (#1173).
+- `archon workflow run` propagates `$ARTIFACTS_DIR`, `$LOG_DIR`, `$BASE_BRANCH` to script-node subprocesses (#1640).
+- `archon-assist` now runs in the live checkout (`worktree.enabled: false`) — closes #1546 (#1555).
+- Bundled `opus[1m]` implement nodes now set `provider: claude` explicitly (#1622).
+- DAG executor no longer leaves zombie workflow runs behind when Pi cleanup hangs (#1563).
+- Workflow runs no longer sweep scratch artifacts from `git add -A` sites in the live checkout (#1506).
+- `$nodeId.output` substitution stringifies array/object fields as JSON (#1482).
+- `archon doctor` and `archon setup` no longer interleave `[archon] loaded N keys` boot lines and Pino info JSON with their checklist output. Set `ARCHON_VERBOSE_BOOT=1` or `LOG_LEVEL=debug` to restore the boot lines; pass `--verbose` to re-enable structured Pino logs for those commands (#1608).
+- `archon --version`, `-V`, `-version`, and lone `-v` are now all treated as version requests (#1444).
+- Docker: resolve Claude binary to the glibc variant on Debian images (#1521).
+- Docker: `git config --global --add safe.directory` in the entrypoint now de-duplicates entries before adding, preventing unbounded growth of `~/.gitconfig` now that `/home/appuser` is persisted (#1518).
+- Docker: `setup-auth` now warns at startup when `CODEX_*` env vars are absent but a persisted `~/.codex/auth.json` from a previous run still exists, so operators don't accidentally use stale or revoked credentials (#1518).
+- Orchestrator creates `~/.archon/workspaces` before spawning an AI provider (#1529).
+- Marketplace auto-review pipeline hardening: pin glibc Claude binary in CI and handle multi-line diff values (#1641), import `@archon/workflows/loader` by relative path (#1642), validate-schema exits 0 so decide can route invalid submissions (#1643), silence loader Pino logs (#1644), and only validate workflow-shaped YAMLs while registering providers (#1645).
+
+## [0.3.10] - 2026-04-29
+
+Maintainer workflow suite, loop output variables, and broad workflow engine fixes
+
+### Added
+
+- Bundled maintainer workflow suite: `maintainer-standup` for daily PR/issue triage (#1428), contributor-reply surfacing (#1457), `maintainer-review-pr` for automated code review (#1430), cross-workflow review memory (#1458), and a Pi/Minimax variant of standup (#1480).
+- `$LOOP_PREV_OUTPUT` substitution variable in loop node prompts, giving each iteration access to the cleaned output of the previous pass (#1367).
+- `mutates_checkout` flag on workflow nodes to permit concurrent runs against a live checkout without requiring worktree isolation (#1438).
+- Explicit `tags` field in workflow YAML for categorization and filtering (#1190).
+- Pi provider `ModelRegistry` support for custom model slugs and automatic auth bypass for unmapped providers (#1284).
+- Autodetection of canonical Claude and Codex binary install paths so explicit config is not required on standard installations (#1361).
+
+### Changed
+
+- Model validation delegated entirely to provider SDKs; Archon no longer rejects unknown model strings at workflow load time, so new vendor models work immediately without an Archon update (#1463).
+- Claude Agent SDK updated to 0.2.121 and Codex SDK to 0.125.0 (#1460).
+- Default Opus model pin switched to the `opus[1m]` alias (#1395).
+
+### Fixed
+
+- PR-creating workflows now correctly target `$BASE_BRANCH` instead of a hardcoded branch name (#1479).
+- Markdown code blocks inside `$nodeId.output` values no longer trigger false DAG validation errors (#1478).
+- `CLAUDE_BIN_PATH` environment variable now honoured in dev mode on hosts with libc mismatches (#1481).
+- Orchestrator clears stale session IDs on `error_during_execution` to prevent infinite failure loops (#1294).
+- Bash and script node failure messages shortened and made more actionable (#1393).
+- Pi provider structured-output parser now tolerates prose preamble before the JSON payload (#1440).
+- Docker bind-mount restarts now register `safe.directory` for all repos, not only the primary one (#1307).
+- CLI commands such as `--version` and `--help` no longer crash when bundled skill source files are absent (#1394).
+- `--no-env-file` flag no longer incorrectly passed to the native Claude binary in dev mode (#1461).
+- `$nodeId.output` references now substituted correctly inside approval gate messages (#1426).
+- `ARTIFACTS_DIR`, `LOG_DIR`, and `BASE_BRANCH` now exported into bash node subprocess environments (#1387).
+- Approval gate no longer bypassed after a reject-with-redraft on workflow resume (#1435).
+- Discord login failure now contained so it does not crash the server process (#1365).
+- Pi provider package-directory shim installed in compiled binary so Pi workflows run correctly outside a source checkout (#1360).
+
+### Added
+
+- **`$LOOP_PREV_OUTPUT` workflow variable (loop nodes only)** — exposes the previous iteration's cleaned output (after `<promise>` tag stripping) to the current iteration's prompt. Empty on the first iteration and on the first iteration after resuming from an interactive approval gate. Enables `fresh_context: true` loops to reference what the prior pass said or did without carrying full session history. (#1367)
+
+### Changed
+
+- **Provider/model resolution: trust the SDK, drop allow-lists.** Removed `inferProviderFromModel` and `isModelCompatible` entirely. Provider is now resolved via a flat explicit chain — `node.provider ?? workflow.provider ?? config.assistant` — and never inferred from the model string. Model strings pass through to the SDK unchanged; the SDK validates them at request time. Codex's stream loop now matches Claude's contract (every terminal close emits exactly one `result` chunk; `error` events without a recovering `turn.completed` synthesize `result.isError` with subtype `codex_stream_incomplete`; `turn.failed` becomes `codex_turn_failed`). AI nodes that exit the streaming loop with empty assistant text and no structured output now fail loudly with `dag.node_empty_output` instead of completing as silent zero-output successes. Provider-id typos (workflow-level and per-node) are caught at YAML load time. **Migration**: workflows that previously relied on cross-provider model inference (e.g. `model: gpt-5.2-codex` with no `provider:`, expecting Archon to pick `codex` because Claude's allow-list rejected the string) must now set `provider:` explicitly. Workflows that already set both `provider:` and `model:` — and workflows that set only `model:` matching `config.assistant` — keep working unchanged. (#1463)
+
+### Fixed
+
+- **Bash and script node failures no longer leak the inline script body into user-visible errors and logs.** When a `bash:` or `script:` DAG node failed, the error string interpolated `err.message` from Node's `ExecFileException`, which begins with `Command failed: bash -c <body>` (or `bun -e <body>`) — embedding the entire substituted script body. Pino's default error serializer compounded this by writing `err.message`, `err.stack`, and `err.cmd` separately, producing three copies of the body per failure across the CLI, Web UI, and `node_failed` event payload. Diagnostic output (e.g. `Expected ")" but found "x" at [eval]:4:241`) was buried at the end. A new `formatSubprocessFailure()` helper now strips the `Command failed:` prefix line, prefers `stderr` over the message body, tail-caps at 2 KB, and exposes a controlled `{exitCode, killed, stderrTail}` log subset — never the raw error. Timeout / ENOENT / EACCES branches now also log through the sanitized helper, so the body cannot leak via the timeout path either. (#1389)
+- **Claude provider crashed in dev mode with `error: unknown option '--no-env-file'`.** The Claude Agent SDK switched from shipping `cli.js` to per-platform native binaries (via optional deps) in the 0.2.x series. Archon's `shouldPassNoEnvFile` predicate kept emitting the Bun-only `--no-env-file` flag in dev mode (when the SDK resolves its bundled binary), which the native binary rejects. Tightened the predicate to only emit the flag for explicitly-configured Bun-runnable JS entry points (`.js`/`.mjs`/`.cjs`). Target-repo `.env` isolation is unchanged — `stripCwdEnv()` at process boot remains the primary guard, and the native Claude binary does not auto-load `.env` from its cwd. (#1461)
+- **Pi structured-output now tolerates reasoning-model prose preamble.** `tryParseStructuredOutput` previously returned `undefined` whenever the assistant text wasn't pure JSON, even when the JSON object was clearly emitted at the end of a "Let me evaluate..." preamble. Reasoning models — observed on Minimax M2.7 — routinely "think out loud" before emitting structured output despite explicit JSON-only prompts. The parser now falls back to a forward-scan from the first `{` when the clean parse fails, recovering the structured output without changing the success path for fully compliant models. (#1440)
+- **`CLAUDE_BIN_PATH` is now honored in dev mode.** Previously the env var was silently ignored when running from source (`BUNDLED_IS_BINARY=false`) — `resolveClaudeBinaryPath()` early-returned `undefined` before reading it, leaving glibc Linux contributors with no working escape hatch when the Claude SDK's bundled-binary auto-resolution picked the musl variant first. The env-var check now runs in both modes; config-file path (`assistants.claude.claudeBinaryPath`) remains binary-mode-only since it's a per-repo, not per-machine setting. Env-loading and target-repo `.env` isolation are unchanged — same `stripCwdEnv()` boot-time guard and same `shouldPassNoEnvFile()` predicate run downstream. (#1481)
+
 ## [0.3.9] - 2026-04-22
 
 First release with working compiled binaries since v0.3.6. Both v0.3.7 and v0.3.8 were tagged but neither shipped release assets — v0.3.7 was blocked by two genuine binary-runtime bugs (Pi SDK's module-init crash + Bun `--bytecode` producing broken output), and v0.3.8 was blocked by an unrelated CI smoke-test regression where `release.yml`'s Claude resolver test required an `origin` remote that the fresh `git init` test repo didn't have. Both superseded tags remain for history; their GitHub Releases were deleted at the time of tagging so `releases/latest` fell back to v0.3.6 throughout, keeping `install.sh` and Homebrew safe. v0.3.9 is what users actually install.

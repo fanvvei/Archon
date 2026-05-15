@@ -15,8 +15,12 @@
  * Binary resolution:
  * - In compiled binaries, `pathToClaudeCodeExecutable` is resolved from
  *   `CLAUDE_BIN_PATH` env or `assistants.claude.claudeBinaryPath` config;
- *   see ./binary-resolver.ts. In dev mode the SDK resolves cli.js itself
- *   from node_modules.
+ *   see ./binary-resolver.ts. In dev mode the resolver returns undefined
+ *   and the SDK picks its bundled per-platform native binary (Mach-O/ELF/PE
+ *   from `@anthropic-ai/claude-agent-sdk-<platform>` optional dep). Pre-0.2.x
+ *   SDKs shipped `cli.js` in the package and dev mode resolved that JS file;
+ *   the SDK switched to native binaries in the 0.2.x series. See
+ *   `shouldPassNoEnvFile` for the implications on the `--no-env-file` flag.
  */
 import {
   query,
@@ -432,19 +436,20 @@ async function applyNodeConfig(
   if (nodeConfig.skills) {
     const skills = nodeConfig.skills;
     const agentId = 'dag-node-skills';
-    const agentTools = options.tools ? [...(options.tools as string[]), 'Skill'] : ['Skill'];
     const agentDef: {
       description: string;
       prompt: string;
       skills: string[];
-      tools: string[];
+      tools?: string[];
       model?: string;
     } = {
       description: 'DAG node with skills',
       prompt: `You have preloaded skills: ${skills.join(', ')}. Use them when relevant.`,
       skills,
-      tools: agentTools,
     };
+    if (options.tools) {
+      agentDef.tools = [...(options.tools as string[]), 'Skill'];
+    }
     if (options.model) agentDef.model = options.model;
     options.agents = { [agentId]: agentDef };
     options.agent = agentId;
@@ -535,31 +540,43 @@ interface ToolResultEntry {
   toolCallId?: string;
 }
 
+/** Bun-runnable JS extensions. `.ts`/`.tsx`/`.jsx` are excluded — the SDK has
+ * never shipped those as entry points, so accepting them would only widen the
+ * surface for misconfiguration. */
+const BUN_JS_EXTENSIONS = ['.js', '.mjs', '.cjs'] as const;
+
 /**
  * Decide whether the Claude subprocess should be spawned with `--no-env-file`.
  *
- * `--no-env-file` is a Bun flag that prevents auto-loading `.env` from the
- * target repo cwd into the spawned process. It only applies when the SDK
- * spawns the executable via Bun/Node — i.e. when the executable is a `.js`
- * file (dev mode resolves cli.js, npm-installed resolves cli.js). For a
- * native Claude Code binary (curl/PowerShell installer at
- * `~/.local/bin/claude`), the SDK execs the binary directly and the flag
- * gets passed to the native binary, which rejects unknown options and
- * exits code 1.
+ * `--no-env-file` is a Bun flag (consumed by the Bun runtime, not by Claude
+ * Code itself) that prevents auto-loading `.env` from the target repo cwd
+ * into the spawned process. It only does anything when the SDK spawns a
+ * Bun-runnable JS file via `bun cli.js …` — Bun parses the flag and skips
+ * its env autoload. For native Claude Code binaries the flag is meaningless
+ * and, worse, gets handed to the binary which rejects unknown options.
  *
- * Returning `false` for native binaries is verified safe — the native
- * binary does not auto-load `.env` from CWD (probed end-to-end with
- * sentinel `.env` and `.env.local` in the workflow CWD; both arrived
- * UNSET in the spawned bash tool). The first-layer protection —
- * `stripCwdEnv()` in `@archon/paths` (#1067) — removes CWD env keys from
- * the parent process before spawn, so the subprocess inherits a clean
- * env regardless of executable type.
+ * The dev-mode `cliPath === undefined` path used to imply "JS executable"
+ * because the SDK shipped `cli.js` inside its package. SDK 0.2.x switched
+ * to per-platform native binaries (e.g. `@anthropic-ai/claude-agent-sdk-darwin-arm64/claude`),
+ * so dev mode now resolves to a native executable and the historical
+ * `undefined → true` heuristic is unsafe. Only return `true` when we have
+ * an explicit Bun-runnable JS path (`.js`/`.mjs`/`.cjs`) — i.e. when the
+ * operator pointed Archon at a legacy Bun/Node-runnable cli script.
+ * Otherwise return `false`.
+ *
+ * Safety: target-repo `.env` leaks are prevented by `stripCwdEnv()` in
+ * `@archon/paths` (#1067), which deletes CWD `.env` keys from
+ * `process.env` at every Archon entry point before any subprocess is
+ * spawned. The native Claude binary does not auto-load `.env` from its
+ * cwd either (verified end-to-end with sentinel keys). `--no-env-file`
+ * was belt-and-suspenders for the JS-via-Bun case only.
  *
  * Exported so the decision can be unit-tested without needing to mock
  * `BUNDLED_IS_BINARY` or run the full provider sendQuery pathway.
  */
 export function shouldPassNoEnvFile(cliPath: string | undefined): boolean {
-  return cliPath === undefined || cliPath.endsWith('.js');
+  if (cliPath === undefined) return false;
+  return BUN_JS_EXTENSIONS.some(ext => cliPath.endsWith(ext));
 }
 
 /**
@@ -577,10 +594,7 @@ function buildBaseClaudeOptions(
   cliPath: string | undefined
 ): Options {
   const isJsExecutable = shouldPassNoEnvFile(cliPath);
-  getLog().debug(
-    { cliPath: cliPath ?? null, isJsExecutable, passesNoEnvFile: isJsExecutable },
-    'claude.subprocess_env_file_flag'
-  );
+  getLog().debug({ cliPath: cliPath ?? null, isJsExecutable }, 'claude.subprocess_env_file_flag');
 
   return {
     cwd,
@@ -609,7 +623,7 @@ function buildBaseClaudeOptions(
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     systemPrompt: requestOptions?.systemPrompt ?? { type: 'preset', preset: 'claude_code' },
-    settingSources: assistantDefaults.settingSources ?? ['project'],
+    settingSources: assistantDefaults.settingSources ?? ['project', 'user'],
     hooks: buildToolCaptureHooks(toolResultQueue),
     stderr: (data: string): void => {
       const output = data.trim();
@@ -783,7 +797,14 @@ async function* streamClaudeMessages(
       };
       const tokens = normalizeClaudeUsage(resultMsg.usage);
       const sdkErrors = Array.isArray(resultMsg.errors) ? resultMsg.errors : undefined;
-      if (resultMsg.is_error) {
+      // SDKResultSuccess declares `is_error: boolean` (not literal false). When a
+      // model terminates via a configured stop sequence (stop_reason ===
+      // 'stop_sequence') the SDK can set is_error: true while keeping
+      // subtype: 'success' — its encoding of "non-default termination, not a
+      // failure". Treat that pair as a clean success so downstream consumers
+      // (which gate failure on isError) don't misclassify it.
+      const isRealError = resultMsg.is_error === true && resultMsg.subtype !== 'success';
+      if (isRealError) {
         getLog().error(
           {
             sessionId: resultMsg.session_id,
@@ -793,6 +814,14 @@ async function* streamClaudeMessages(
           },
           'claude.result_is_error'
         );
+      } else if (resultMsg.is_error === true && resultMsg.subtype === 'success') {
+        getLog().debug(
+          {
+            sessionId: resultMsg.session_id,
+            stopReason: resultMsg.stop_reason,
+          },
+          'claude.result_success_validated'
+        );
       }
       yield {
         type: 'result',
@@ -801,8 +830,8 @@ async function* streamClaudeMessages(
         ...(resultMsg.structured_output !== undefined
           ? { structuredOutput: resultMsg.structured_output }
           : {}),
-        ...(resultMsg.is_error ? { isError: true, errorSubtype: resultMsg.subtype } : {}),
-        ...(resultMsg.is_error && sdkErrors?.length ? { errors: sdkErrors } : {}),
+        ...(isRealError ? { isError: true, errorSubtype: resultMsg.subtype } : {}),
+        ...(isRealError && sdkErrors?.length ? { errors: sdkErrors } : {}),
         ...(resultMsg.total_cost_usd !== undefined ? { cost: resultMsg.total_cost_usd } : {}),
         ...(resultMsg.stop_reason != null ? { stopReason: resultMsg.stop_reason } : {}),
         ...(resultMsg.num_turns !== undefined ? { numTurns: resultMsg.num_turns } : {}),

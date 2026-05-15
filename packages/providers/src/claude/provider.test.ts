@@ -18,16 +18,35 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
 
 import { ClaudeProvider, shouldPassNoEnvFile } from './provider';
 import * as claudeModule from './provider';
+import * as binaryResolver from './binary-resolver';
 
 describe('shouldPassNoEnvFile', () => {
-  test('returns true when cliPath is undefined (dev mode — SDK spawns cli.js via Bun)', () => {
-    expect(shouldPassNoEnvFile(undefined)).toBe(true);
+  test('returns false when cliPath is undefined (dev mode — SDK 0.2.x resolves a native binary)', () => {
+    // Pre-0.2.x the SDK shipped cli.js and dev mode = JS. Since 0.2.x the
+    // SDK ships per-platform native binaries via optional deps. The flag
+    // (a Bun runtime option) is meaningless to native binaries and gets
+    // rejected as `error: unknown option '--no-env-file'`. CWD .env leak
+    // protection comes from stripCwdEnv() at entry, not from this flag.
+    expect(shouldPassNoEnvFile(undefined)).toBe(false);
   });
 
-  test('returns true for an explicit cli.js path (npm-installed, SDK spawns via Bun/Node)', () => {
+  test('returns true for an explicit cli.js path (legacy npm-installed cli.js, SDK spawns via Bun)', () => {
     expect(
       shouldPassNoEnvFile('/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js')
     ).toBe(true);
+  });
+
+  test('returns true for .mjs and .cjs paths (also Bun-runnable JS entry points)', () => {
+    expect(shouldPassNoEnvFile('/path/to/cli.mjs')).toBe(true);
+    expect(shouldPassNoEnvFile('/path/to/cli.cjs')).toBe(true);
+  });
+
+  test('returns false for non-Bun-runnable JS-adjacent extensions', () => {
+    // `.ts`/`.tsx`/`.jsx` are deliberately excluded — the SDK never shipped
+    // those as entry points, so accepting them would only widen misconfiguration.
+    expect(shouldPassNoEnvFile('/path/to/cli.ts')).toBe(false);
+    expect(shouldPassNoEnvFile('/path/to/cli.tsx')).toBe(false);
+    expect(shouldPassNoEnvFile('/path/to/cli.jsx')).toBe(false);
   });
 
   test('returns false for a native binary path (curl installer, SDK execs directly)', () => {
@@ -64,10 +83,17 @@ describe('ClaudeProvider', () => {
   describe('constructor', () => {
     test('throws when running as root (UID 0)', () => {
       const spy = spyOn(claudeModule, 'getProcessUid').mockReturnValue(0);
-      expect(() => new ClaudeProvider()).toThrow(
-        'does not support bypassPermissions when running as root'
-      );
-      spy.mockRestore();
+      // IS_SANDBOX=1 bypasses the root check; clear it so the guard can trigger
+      const savedSandbox = process.env.IS_SANDBOX;
+      delete process.env.IS_SANDBOX;
+      try {
+        expect(() => new ClaudeProvider()).toThrow(
+          'does not support bypassPermissions when running as root'
+        );
+      } finally {
+        if (savedSandbox !== undefined) process.env.IS_SANDBOX = savedSandbox;
+        spy.mockRestore();
+      }
     });
 
     test('does not throw for non-root user', () => {
@@ -505,8 +531,10 @@ describe('ClaudeProvider', () => {
       const callArgs = mockQuery.mock.calls[0][0] as {
         options: { env: NodeJS.ProcessEnv; executableArgs?: string[] };
       };
-      // --no-env-file prevents Bun from auto-loading .env in subprocess CWD
-      expect(callArgs.options.executableArgs).toEqual(['--no-env-file']);
+      // executableArgs is omitted when cliPath is undefined (dev mode, SDK
+      // 0.2.x resolves a native binary). CWD .env leak protection comes
+      // from stripCwdEnv() at entry, not from the --no-env-file flag.
+      expect(callArgs.options.executableArgs).toBeUndefined();
       expect(callArgs.options.env.CUSTOM_USER_KEY).toBe('user-trusted-value');
       // Windows uses "Path" casing in spread objects and USERPROFILE instead of HOME
       const envPath = callArgs.options.env.PATH ?? callArgs.options.env.Path;
@@ -519,6 +547,37 @@ describe('ClaudeProvider', () => {
       // Cleanup
       if (originalKey !== undefined) process.env.CUSTOM_USER_KEY = originalKey;
       else delete process.env.CUSTOM_USER_KEY;
+    });
+
+    test('passes executableArgs: [--no-env-file] when cliPath ends in a Bun-runnable JS extension', async () => {
+      // Belt-and-suspenders integration check: the dev-mode path is exercised
+      // in the test above (executableArgs: undefined). This test exercises the
+      // legacy explicit-cli.js path through the real buildBaseClaudeOptions
+      // codepath, so a regression in the conditional spread would be caught.
+      const spy = spyOn(binaryResolver, 'resolveClaudeBinaryPath').mockResolvedValue(
+        '/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js'
+      );
+
+      mockQuery.mockImplementation(async function* () {
+        // empty
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace')) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as {
+        options: {
+          executableArgs?: string[];
+          pathToClaudeCodeExecutable?: string;
+        };
+      };
+      expect(callArgs.options.executableArgs).toEqual(['--no-env-file']);
+      expect(callArgs.options.pathToClaudeCodeExecutable).toBe(
+        '/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js'
+      );
+
+      spy.mockRestore();
     });
 
     test('classifies exit code errors as crash and retries up to 3 times', async () => {
@@ -674,12 +733,32 @@ describe('ClaudeProvider', () => {
       expect(callArgs.options.settingSources).toEqual(['project', 'user']);
     });
 
-    test('defaults settingSources to project when not provided', async () => {
+    test('defaults settingSources to project + user when not provided', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'test-session' };
       });
 
       for await (const _ of client.sendQuery('test', '/tmp')) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual(['project', 'user']);
+    });
+
+    test("honors explicit settingSources: ['project'] to opt out of user scope", async () => {
+      // Locks in the contract: setting settingSources: ['project'] in
+      // .archon/config.yaml must NOT be silently widened to the new default.
+      // A future refactor that drops the `?? ['project', 'user']` guard would
+      // expand skill/command/agent scope for every project-only deployment.
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        assistantConfig: { settingSources: ['project'] },
+      })) {
         // consume
       }
 
@@ -1167,6 +1246,44 @@ describe('sendQuery decomposition behaviors', () => {
     );
   });
 
+  test('treats is_error: true + subtype: success as clean success (stop_sequence)', async () => {
+    // Claude Agent SDK's SDKResultSuccess explicitly types is_error as boolean
+    // (not literal false). When a model is configured with stop sequences (e.g.
+    // via output_format / json_schema enforcement) the SDK reports is_error:
+    // true alongside subtype: 'success' and stop_reason: 'stop_sequence' — its
+    // way of signalling "non-default termination, but not a failure".
+    // Regression test for #1425.
+    mockQuery.mockImplementation(async function* () {
+      yield {
+        type: 'result',
+        session_id: 'sid-stop-seq',
+        is_error: true,
+        subtype: 'success',
+        stop_reason: 'stop_sequence',
+      };
+    });
+
+    const chunks = [];
+    for await (const chunk of client.sendQuery('test', '/workspace')) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toMatchObject({
+      type: 'result',
+      sessionId: 'sid-stop-seq',
+      stopReason: 'stop_sequence',
+    });
+    expect(chunks[0]).not.toHaveProperty('isError');
+    expect(chunks[0]).not.toHaveProperty('errorSubtype');
+    expect(chunks[0]).not.toHaveProperty('errors');
+    expect(mockLogger.error).not.toHaveBeenCalledWith(expect.anything(), 'claude.result_is_error');
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'sid-stop-seq', stopReason: 'stop_sequence' }),
+      'claude.result_success_validated'
+    );
+  });
+
   describe('inline agents (nodeConfig.agents)', () => {
     test('passes inline agents map through to SDK options.agents', async () => {
       mockQuery.mockImplementation(async function* () {
@@ -1266,6 +1383,52 @@ describe('sendQuery decomposition behaviors', () => {
         expect.objectContaining({ nodeSkills: ['my-skill'] }),
         'claude.inline_agents_override_skills_wrapper'
       );
+    });
+
+    test('skills without allowed_tools omits tools field so SDK defaults apply', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        nodeConfig: {
+          skills: ['agent-browser'],
+          // no allowed_tools → options.tools is undefined
+        },
+      })) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      const outAgents = callArgs.options.agents as Record<
+        string,
+        { description: string; tools?: string[] }
+      >;
+      // tools should NOT be set — lets SDK provide all default native tools
+      expect(outAgents['dag-node-skills'].tools).toBeUndefined();
+    });
+
+    test('skills with allowed_tools includes Skill in the tools list', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        nodeConfig: {
+          skills: ['agent-browser'],
+          allowed_tools: ['Bash', 'Read'],
+        },
+      })) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      const outAgents = callArgs.options.agents as Record<
+        string,
+        { description: string; tools?: string[] }
+      >;
+      // tools should include the explicit list plus Skill
+      expect(outAgents['dag-node-skills'].tools).toEqual(['Bash', 'Read', 'Skill']);
     });
 
     test('does NOT warn when inline agents do not collide with the skills wrapper', async () => {

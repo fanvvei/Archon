@@ -32,6 +32,8 @@
 **Git Workflow and Releases**
 - `main` is the release branch. Never commit directly to `main`.
 - `dev` is the working branch. All feature work branches off `dev` and merges back into `dev`.
+- All PRs must use the template at `.github/PULL_REQUEST_TEMPLATE.md` — fill in every section. When opening a PR via `gh pr create`, copy the template into the body explicitly; GitHub only auto-applies it through the web UI.
+- Link the issue with `Closes #<number>` (or `Fixes` / `Resolves`) in the PR description so it auto-closes on merge.
 - To release, use the `/release` skill. It compares `dev` to `main`, generates changelog entries, bumps the version, and creates a PR to merge `dev` into `main`.
 - Releases follow Semantic Versioning: `/release` (patch), `/release minor`, `/release major`.
 - Changelog lives in `CHANGELOG.md` and follows Keep a Changelog format.
@@ -150,7 +152,7 @@ bun run format:check
 bun run validate
 ```
 
-This runs `check:bundled`, type-check, lint, format check, and tests. All five must pass for CI to succeed.
+This runs `check:bundled`, `check:bundled-skill`, type-check, lint, format check, and tests. All six must pass for CI to succeed.
 
 ### ESLint Guidelines
 
@@ -250,6 +252,13 @@ bun run cli complete <branch-name> --force  # Skip uncommitted-changes check
 bun run cli serve
 bun run cli serve --port 4000
 bun run cli serve --download-only  # Download without starting
+
+# Install the bundled Archon skill into a project
+bun run cli skill install
+bun run cli skill install /path/to/project
+
+# Verify your Archon setup (Claude binary, gh auth, DB, adapters)
+bun run cli doctor
 
 # Show version
 bun run cli version
@@ -473,9 +482,9 @@ The system supports configuring default models and options per assistant in `.ar
 assistants:
   claude:
     model: sonnet  # or 'opus', 'haiku', 'claude-*', 'inherit'
-    settingSources:  # Controls which CLAUDE.md files Claude SDK loads
-      - project      # Default: only project-level CLAUDE.md
-      - user         # Optional: also load ~/.claude/CLAUDE.md
+    settingSources:  # Controls which CLAUDE.md, skills, commands, and agents the SDK loads
+      - project      # Project-level <cwd>/.claude/ (included in default)
+      - user         # User-level ~/.claude/ (included in default; omit both to restrict to project-only)
     claudeBinaryPath: /absolute/path/to/claude  # Optional: Claude Code executable.
                                                 # Native binary (curl installer at
                                                 # ~/.local/bin/claude) or npm cli.js.
@@ -499,10 +508,9 @@ assistants:
 3. SDK defaults
 
 **Model Validation:**
-- Workflows are validated at load time for provider/model compatibility
-- Claude models: `sonnet`, `opus`, `haiku`, `claude-*`, `inherit`
-- Codex models: Any model except Claude-specific aliases
-- Invalid combinations fail workflow loading with clear error messages
+- Workflows are validated at load time for provider _identity_ only — `provider:` (workflow-level and per-node) must be a registered provider id, otherwise the YAML is rejected with `Unknown provider '<id>'. Registered: claude, codex, pi`.
+- Model strings are NOT validated by Archon. Whatever the user writes in `model:` is forwarded verbatim to the resolved SDK. Vendor SDKs ship new models faster than Archon can update; the SDK and the upstream API are the source of truth for what names exist.
+- Provider is resolved via an explicit chain: `node.provider ?? workflow.provider ?? config.assistant`. Model never influences provider selection.
 
 ### Running the App in Worktrees
 
@@ -689,6 +697,7 @@ async function createSession(conversationId: string, codebaseId: string) {
 - `$DOCS_DIR` - Documentation directory path; configured via `docs.path` in `.archon/config.yaml`. Defaults to `docs/`. Never throws.
 - `$LOOP_USER_INPUT` - User feedback provided via `/workflow approve <id> <text>` at an interactive loop gate. Only populated on the first iteration of a resumed interactive loop; empty string on all other iterations.
 - `$REJECTION_REASON` - Reviewer feedback provided via `/workflow reject <id> <reason>` at an approval gate. Only populated in `on_reject` prompts; empty string elsewhere.
+- `$LOOP_PREV_OUTPUT` - Cleaned output of the previous loop iteration (loop nodes only). Empty string on the first iteration (no prior output exists). Useful for `fresh_context: true` loops that need to reference what the previous pass produced or why it failed without carrying full session history.
 
 **Command Types:**
 
@@ -717,7 +726,7 @@ async function createSession(conversationId: string, codebaseId: string) {
 - Source builds: Loaded from filesystem at runtime
 - Merged with repo-specific commands/workflows (repo overrides defaults by name)
 - Opt-out: Set `defaults.loadDefaultCommands: false` or `defaults.loadDefaultWorkflows: false` in `.archon/config.yaml`
-- **After adding, removing, or editing a default file, run `bun run generate:bundled`** to refresh the embedded bundle. `bun run validate` (and CI) run `check:bundled` and will fail loudly if the generated file is stale.
+- **After adding, removing, or editing a default file, run `bun run generate:bundled`** to refresh the embedded bundle. `bun run validate` (and CI) run `check:bundled` and `check:bundled-skill` and will fail loudly if either generated file is stale.
 
 **Home-scoped ("global") workflows, commands, and scripts** (user-level, applies to every project):
 - Workflows: `~/.archon/workflows/` (or `$ARCHON_HOME/workflows/`)
@@ -779,7 +788,7 @@ Pattern: Use `classifyIsolationError()` (from `@archon/isolation`) to map git er
 - `DELETE /api/workflows/:name` - Delete a user-defined workflow; bundled defaults cannot be deleted
 
 **Workflow Run Lifecycle:**
-- `POST /api/workflows/runs/{runId}/resume` - Mark a failed run as ready for auto-resume on next invocation
+- `POST /api/workflows/runs/{runId}/resume` - Resume a failed run from where it left off (skips already-completed DAG nodes; AI session context is not restored).
 - `POST /api/workflows/runs/{runId}/abandon` - Abandon a non-terminal run (marks as cancelled)
 - `DELETE /api/workflows/runs/{runId}` - Delete a terminal workflow run and its events
 
