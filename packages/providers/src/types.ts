@@ -82,6 +82,22 @@ export interface PiProviderDefaults {
   env?: Record<string, string>;
 }
 
+/**
+ * Provider defaults for OpenCode (@opencode-ai/sdk).
+ * Connects to a running OpenCode server via HTTP API.
+ */
+export interface OpencodeProviderDefaults {
+  [key: string]: unknown;
+  /** Model ref in 'provider/model-id' format, e.g. 'anthropic/claude-3-5-sonnet-20241022' */
+  model?: string;
+  /** OpenCode server hostname. @default '127.0.0.1' */
+  hostname?: string;
+  /** OpenCode server port. @default 4096 */
+  port?: number;
+  /** Server startup timeout in ms. @default 5000 */
+  timeout?: number;
+}
+
 /** Generic per-provider defaults bag used by config surfaces and UI. */
 export type ProviderDefaults = Record<string, unknown>;
 

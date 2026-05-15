@@ -17,6 +17,7 @@ import type {
   ClaudeProviderDefaults,
   CodexProviderDefaults,
   PiProviderDefaults,
+  OpencodeProviderDefaults,
   ProviderDefaultsMap,
 } from '@archon/providers/types';
 
@@ -24,6 +25,7 @@ export type {
   ClaudeProviderDefaults,
   CodexProviderDefaults,
   PiProviderDefaults,
+  OpencodeProviderDefaults,
   ProviderDefaultsMap,
 };
 
@@ -43,6 +45,7 @@ export type {
 export type AssistantDefaultsConfig = ProviderDefaultsMap & {
   claude?: ClaudeProviderDefaults;
   codex?: CodexProviderDefaults;
+  opencode?: OpencodeProviderDefaults;
 };
 
 /**
@@ -57,6 +60,7 @@ export type AssistantDefaultsConfig = ProviderDefaultsMap & {
 export type AssistantDefaults = ProviderDefaultsMap & {
   claude: ClaudeProviderDefaults;
   codex: CodexProviderDefaults;
+  opencode: OpencodeProviderDefaults;
 };
 
 export interface GlobalConfig {

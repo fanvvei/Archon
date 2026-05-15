@@ -15,8 +15,10 @@ import type {
 } from './types';
 import { ClaudeProvider } from './claude/provider';
 import { CodexProvider } from './codex/provider';
+import { OpencodeProvider } from './opencode/provider';
 import { CLAUDE_CAPABILITIES } from './claude/capabilities';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
+import { OPENCODE_CAPABILITIES } from './opencode/capabilities';
 import { registerPiProvider } from './community/pi/registration';
 import { UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
@@ -128,6 +130,17 @@ export function registerBuiltinProviders(): void {
         return (
           !claudeAliases.includes(model) && !model.startsWith('claude-') && model !== 'inherit'
         );
+      },
+      builtIn: true,
+    },
+    {
+      id: 'opencode',
+      displayName: 'OpenCode',
+      factory: () => new OpencodeProvider(),
+      capabilities: OPENCODE_CAPABILITIES,
+      isModelCompatible: (model: string): boolean => {
+        // OpenCode supports provider/model-id format
+        return model.includes('/');
       },
       builtIn: true,
     },

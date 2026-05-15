@@ -268,7 +268,7 @@ function getDefaults(): MergedConfig {
   // registry.ts#registerCommunityProviders`), so by the time this runs the
   // registry is populated.
   const providers = getRegisteredProviders();
-  const registeredAssistants: AssistantDefaults = { claude: {}, codex: {} };
+  const registeredAssistants: AssistantDefaults = { claude: {}, codex: {}, opencode: {} };
   for (const provider of providers) {
     if (!(provider.id in registeredAssistants)) {
       registeredAssistants[provider.id] = {};
